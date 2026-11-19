@@ -33,6 +33,7 @@ use IEEE.MATH_REAL.ALL;
 use work.parse_q_pkg.ALL;
 
 entity parse_q_tb_partB is
+  generic (STOP_AFTER_TC11 : boolean := false);
 end entity parse_q_tb_partB;
 
 architecture sim of parse_q_tb_partB is
@@ -67,6 +68,10 @@ architecture sim of parse_q_tb_partB is
   -- =============================================================
   signal n_e_prev     : unsigned(NE_WIDTH-1 downto 0) := (others => '0');
   signal assert_en    : boolean := false;  -- 테스트 진행 중일 때만 검증
+  signal tc11_active       : boolean := false;
+  signal tc11_shift_window : natural range 0 to 2 := 0;
+  signal tc11_run_id       : natural range 0 to 1 := 0;
+  signal tc11_shift_events : natural := 0;
 
   -- Golden model
   type golden_s_t is array (0 to F-1, 0 to Q_IN-1) of integer;
@@ -125,6 +130,58 @@ begin
       end if;
     end if;
   end process p_monitor_ne;
+
+  -- Observe every exponent transition while TC11 is active. The payload
+  -- exposes the low nine bits of acc_phys, including during overflow.
+  p_monitor_tc11_shifts : process(clk_core)
+    variable prev_ne : unsigned(NE_WIDTH-1 downto 0) := (others => '0');
+    variable prev_ch0, prev_ch1 : signed(PAYLOAD_W-1 downto 0) := (others => '0');
+  begin
+    if rising_edge(clk_core) then
+      if rst = '1' then
+        prev_ne := (others => '0');
+        prev_ch0 := (others => '0');
+        prev_ch1 := (others => '0');
+        tc11_shift_events <= 0;
+      else
+        if tc11_active and n_e_out /= prev_ne then
+          assert tc11_shift_window = 1 or tc11_shift_window = 2
+            report "TC11: n_e changed outside an expected shift window"
+            severity failure;
+          assert n_e_out = to_unsigned(tc11_shift_window, NE_WIDTH)
+            report "TC11: incorrect n_e transition" severity failure;
+          if tc11_shift_window = 1 then
+            assert prev_ne = to_unsigned(0, NE_WIDTH) and
+                   prev_ch0 = to_signed(0, PAYLOAD_W) and
+                   payload_out(0) = to_signed(-256, PAYLOAD_W)
+              report "TC11: first protective shift had an incorrect effect"
+              severity failure;
+            if tc11_run_id = 1 then
+              assert prev_ch1 = to_signed(-128, PAYLOAD_W) and
+                     payload_out(1) = to_signed(-64, PAYLOAD_W)
+                report "TC11: first shared shift missed CH1" severity failure;
+            end if;
+          elsif tc11_shift_window = 2 then
+            -- The low nine bits of the pre-shift +256 read as -256.
+            assert prev_ne = to_unsigned(1, NE_WIDTH) and
+                   prev_ch0 = to_signed(-256, PAYLOAD_W) and
+                   payload_out(0) = to_signed(128, PAYLOAD_W)
+              report "TC11: second protective shift had an incorrect effect"
+              severity failure;
+            if tc11_run_id = 1 then
+              assert prev_ch1 = to_signed(64, PAYLOAD_W) and
+                     payload_out(1) = to_signed(32, PAYLOAD_W)
+                report "TC11: second shared shift missed CH1" severity failure;
+            end if;
+          end if;
+          tc11_shift_events <= tc11_shift_events + 1;
+        end if;
+        prev_ne := n_e_out;
+        prev_ch0 := payload_out(0);
+        prev_ch1 := payload_out(1);
+      end if;
+    end if;
+  end process p_monitor_tc11_shifts;
 
   -- =============================================================
   -- MONITOR 2: stall 해제 후 done 전까지 stall 패턴 검증
@@ -315,6 +372,42 @@ begin
         report test_name & " HAS FAILURES!" severity error;
     end procedure;
 
+    -- Check only after the group and any protective shifts have completed.
+    procedure proc_check_tc11_stage(
+      run_id, bit_pos : in integer;
+      stage : in string;
+      expected_ne : in natural;
+      expected_ch0, expected_other : in integer
+    ) is
+      variable expected_payload : integer;
+    begin
+      while stall = '1' loop
+        wait until rising_edge(clk_core);
+      end loop;
+      wait for 1 ns; -- allow top-level output signals to settle
+      assert stall = '0'
+        report "TC11: DUT did not reach a ready/done state" severity failure;
+      assert n_e_out = to_unsigned(expected_ne, NE_WIDTH)
+        report "TC11 run=" & integer'image(run_id) &
+               " bp=" & integer'image(bit_pos) & " " & stage &
+               ": expected n_e=" & integer'image(expected_ne) &
+               " got=" & integer'image(to_integer(n_e_out)) severity failure;
+      for ch in 0 to F-1 loop
+        if ch = 0 then
+          expected_payload := expected_ch0;
+        else
+          expected_payload := expected_other;
+        end if;
+        assert payload_out(ch) = to_signed(expected_payload, PAYLOAD_W)
+          report "TC11 run=" & integer'image(run_id) &
+                 " bp=" & integer'image(bit_pos) & " " & stage &
+                 " CH" & integer'image(ch) &
+                 ": expected payload=" & integer'image(expected_payload) &
+                 " got=" & integer'image(to_integer(payload_out(ch)))
+          severity failure;
+      end loop;
+    end procedure;
+
     -- ─── Helper: 특정 패턴 생성 ───
     type pattern_t is array (0 to W_BIT-1) of natural;
 
@@ -347,6 +440,8 @@ begin
     variable s2          : positive := 2;
     variable rval        : real;
     variable rps         : natural;
+    variable tc11_ne, tc11_ch0, tc11_other : integer;
+    variable tc11_checkpoints : natural;
 
   begin
 
@@ -393,41 +488,112 @@ begin
     -- ║                                                          ║
     -- ║  홀수 sparse group: ps(6)=8 → partial_s = +512           ║
     -- ║  짝수 sparse group: ps(7)=4 → partial_s = -512           ║
-    -- ║  → 두 group이 거의 상쇄 → s(k) ≈ 0                      ║
-    -- ║  → n_e가 불필요하게 올라가지 않아야 함                     ║
-    -- ║                                                          ║
-    -- ║  Parse-Q의 "spatial cancellation" 이점을 검증             ║
+    -- ║  Each pair cancels exactly, but intermediate values fire. ║
+    -- ║  bp 7: -512 -> -256, n_e=1; bp 6: +256 -> +128, n_e=2.  ║
+    -- ║  Run 0: all lanes +/-512; run 1: CH0 +/-512, others +/-128.║
     -- ╚═══════════════════════════════════════════════════════════╝
     -- =============================================================
 
     report "===== TC11: Alternating sign cancellation =====" severity note;
 
-    proc_reset;
+    assert Q_IN = 8 and PAYLOAD_W = 9 and ACC_WIDTH = 13 and
+           W_BIT = 8 and F >= 2 and NE_WIDTH >= 2
+      report "TC11 expected values require the original 8-bit configuration"
+      severity failure;
 
-    -- 양수 group: ps(6)=8, 나머지=0 → partial_s = +512
-    v_pattern := (6 => 8, others => 0);
-    make_pattern_pim_data(v_pattern, v_pim_data);
+    for tc11_run in 0 to 1 loop
+      proc_reset;
+      tc11_checkpoints := 0;
 
-    -- 음수 group: ps(7)=4, 나머지=0 → partial_s = -512
-    v_pattern := (7 => 4, others => 0);
-    make_pattern_pim_data(v_pattern, v_pim_data2);
+      v_pattern := (6 => 8, others => 0); -- +512
+      make_pattern_pim_data(v_pattern, v_pim_data);
+      v_pattern := (7 => 4, others => 0); -- -512
+      make_pattern_pim_data(v_pattern, v_pim_data2);
+      if tc11_run = 1 then
+        -- Only CH0 fires; the other lanes must still shift with it.
+        for ch in 1 to F-1 loop
+          v_pim_data(ch)(6)  := to_unsigned(2, PS_BIT_W); -- +128
+          v_pim_data2(ch)(7) := to_unsigned(1, PS_BIT_W); -- -128
+        end loop;
+      end if;
 
-    proc_start;
+      for ch in 0 to F-1 loop
+        if tc11_run = 1 and ch > 0 then
+          tc11_other := 128;
+        else
+          tc11_other := 512;
+        end if;
+        assert calc_partial_s(v_pim_data(ch)) = tc11_other and
+               calc_partial_s(v_pim_data2(ch)) = -tc11_other
+          report "TC11: stimulus does not form the intended cancellation pair"
+          severity failure;
+      end loop;
 
-    for bp in Q_IN-1 downto 0 loop
-      -- group 0: +512
-      proc_send_pim_group(v_pim_data, bp, false);
-      -- group 1: -512 (last)
-      proc_send_pim_group(v_pim_data2, bp, true);
+      proc_start;
+      assert n_e_out = to_unsigned(0, NE_WIDTH)
+        report "TC11: initial n_e is not zero" severity failure;
+      tc11_run_id <= tc11_run;
+      tc11_active <= true;
+      for bp in Q_IN-1 downto 0 loop
+        if bp = Q_IN-1 then
+          tc11_shift_window <= 1;
+        elsif bp = Q_IN-2 then
+          tc11_shift_window <= 2;
+        else
+          tc11_shift_window <= 0;
+        end if;
+        proc_send_pim_group(v_pim_data, bp, false);
+        if bp = Q_IN-1 then
+          tc11_ne := 1;
+          tc11_ch0 := -256;
+          tc11_other := -256;
+          if tc11_run = 1 then tc11_other := -64; end if;
+        else
+          tc11_ne := 2;
+          tc11_ch0 := 128;
+          tc11_other := 128;
+          if tc11_run = 1 then tc11_other := 32; end if;
+        end if;
+        proc_check_tc11_stage(tc11_run, bp, "after positive group",
+                              tc11_ne, tc11_ch0, tc11_other);
+        tc11_shift_window <= 0;
+        tc11_checkpoints := tc11_checkpoints + 1;
+
+        proc_send_pim_group(v_pim_data2, bp, true);
+        proc_check_tc11_stage(tc11_run, bp, "after cancellation",
+                              tc11_ne, 0, 0);
+        tc11_checkpoints := tc11_checkpoints + 1;
+        for ch in 0 to F-1 loop
+          assert golden_s(ch, bp) = 0
+            report "TC11: golden pair did not cancel" severity failure;
+        end loop;
+      end loop;
+
+      proc_wait_done;
+      assert tc11_checkpoints = 2 * Q_IN
+        report "TC11: not all group checkpoints were reached" severity failure;
+      assert tc11_shift_events = 2
+        report "TC11: expected exactly two observed shift events" severity failure;
+      assert n_e_out = to_unsigned(2, NE_WIDTH)
+        report "TC11: final n_e should be 2" severity failure;
+      for ch in 0 to F-1 loop
+        assert calc_golden_result(golden_s, ch) = 0 and
+               payload_out(ch) = to_signed(0, PAYLOAD_W)
+          report "TC11: final result is not exactly zero at CH" &
+                 integer'image(ch) severity failure;
+      end loop;
+      report "TC11 run=" & integer'image(tc11_run) & ": " &
+             integer'image(tc11_checkpoints) & " group checkpoints, " &
+             integer'image(F) & " lanes; " &
+             integer'image(tc11_shift_events) & " shifts; exact zero, n_e=2"
+        severity note;
+      tc11_active <= false;
     end loop;
 
-    proc_wait_done;
-    proc_check_results("TC11");
-
-    -- 상쇄 시 n_e가 작아야 함
-    report "TC11: n_e = " & integer'image(to_integer(n_e_out)) &
-           " (expected small due to cancellation)"
-      severity note;
+    if STOP_AFTER_TC11 then
+      sim_done <= true;
+      wait;
+    end if;
 
     wait for CLK_CORE_PERIOD * 10;
 
